@@ -275,6 +275,7 @@ type Proxy struct {
 	lb                       *loadbalancer.LB
 	upgradeAuditLogOut       io.Writer
 	upgradeAuditLogErr       io.Writer
+	auditLogHook             chan struct{}
 }
 
 // proxyError is used to wrap errors during proxying and to indicate
@@ -723,16 +724,8 @@ func (p *Proxy) sendError(c *context, id string, code int) {
 	)
 }
 
-func (p *Proxy) makeUpgradeRequest(ctx *context, route *routing.Route, req *http.Request) error {
-	// have to parse url again, because path is not copied by mapRequest
-	backendURL, err := url.Parse(route.Backend)
-	if err != nil {
-		p.log.Errorf("can not parse backend %s, caused by: %s", route.Backend, err)
-		return &proxyError{
-			err:  err,
-			code: http.StatusBadGateway,
-		}
-	}
+func (p *Proxy) makeUpgradeRequest(ctx *context, req *http.Request) error {
+	backendURL := req.URL
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(backendURL)
 	reverseProxy.FlushInterval = p.flushInterval
@@ -744,6 +737,7 @@ func (p *Proxy) makeUpgradeRequest(ctx *context, route *routing.Route, req *http
 		useAuditLog:     p.experimentalUpgradeAudit,
 		auditLogOut:     p.upgradeAuditLogOut,
 		auditLogErr:     p.upgradeAuditLogErr,
+		auditLogHook:    p.auditLogHook,
 	}
 
 	upgradeProxy.serveHTTP(ctx.responseWriter, req)
@@ -759,7 +753,7 @@ func (p *Proxy) makeBackendRequest(ctx *context) (*http.Response, *proxyError) {
 	}
 
 	if p.experimentalUpgrade && isUpgradeRequest(req) {
-		if err = p.makeUpgradeRequest(ctx, ctx.route, req); err != nil {
+		if err = p.makeUpgradeRequest(ctx, req); err != nil {
 			return nil, &proxyError{err: err}
 		}
 

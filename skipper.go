@@ -1,14 +1,17 @@
 package skipper
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
+	"syscall"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -48,6 +51,11 @@ const DefaultPluginDir = "./plugins"
 
 // Options to start skipper.
 type Options struct {
+	// WaitForHealthcheckInterval sets the time that skipper waits
+	// for the loadbalancer in front to become unhealthy. Defaults
+	// to 0.
+	WaitForHealthcheckInterval time.Duration
+
 	// WhitelistedHealthcheckCIDR appends the whitelisted IP Range to the inernalIPS range for healthcheck purposes
 	WhitelistedHealthCheckCIDR []string
 
@@ -508,14 +516,22 @@ type Options struct {
 
 	// EnableSwarm enables skipper fleet communication, required by e.g.
 	// the cluster ratelimiter
-	EnableSwarm                       bool
+	EnableSwarm bool
+	// redis based swarm
+	SwarmRedisURLs         []string
+	SwarmRedisReadTimeout  time.Duration
+	SwarmRedisWriteTimeout time.Duration
+	SwarmRedisPoolTimeout  time.Duration
+	SwarmRedisMinIdleConns int
+	SwarmRedisMaxIdleConns int
+	// swim based swarm
 	SwarmKubernetesNamespace          string
 	SwarmKubernetesLabelSelectorKey   string
 	SwarmKubernetesLabelSelectorValue string
 	SwarmPort                         int
 	SwarmMaxMessageBuffer             int
 	SwarmLeaveTimeout                 time.Duration
-
+	// swim based swarm for local testing
 	SwarmStaticSelf  string // 127.0.0.1:9001
 	SwarmStaticOther string // 127.0.0.1:9002,127.0.0.1:9003
 }
@@ -706,7 +722,32 @@ func listenAndServe(proxy http.Handler, o *Options) error {
 		return srv.ListenAndServeTLS(o.CertPathTLS, o.KeyPathTLS)
 	}
 	log.Infof("TLS settings not found, defaulting to HTTP")
-	return srv.ListenAndServe()
+
+	idleConnsCH := make(chan struct{})
+	go func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+
+		<-sigs
+
+		log.Infof("Got shutdown signal, wait %v for health check", o.WaitForHealthcheckInterval)
+		time.Sleep(o.WaitForHealthcheckInterval)
+
+		log.Info("Start shutdown")
+		if err := srv.Shutdown(context.Background()); err != nil {
+			log.Errorf("Failed to graceful shutdown: %v", err)
+		}
+		close(idleConnsCH)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Errorf("Failed to start to ListenAndServe: %v", err)
+		return err
+	}
+
+	<-idleConnsCH
+	log.Infof("done.")
+	return nil
 }
 
 // Run skipper.
@@ -852,53 +893,71 @@ func Run(o Options) error {
 		ClientTLS:                o.ClientTLS,
 	}
 
-	var theSwarm *swarm.Swarm
+	var swarmer ratelimit.Swarmer
+	var swops *swarm.Options
+	var redisOptions *ratelimit.RedisOptions
 	if o.EnableSwarm {
-		swops := swarm.Options{
-			SwarmPort:        uint16(o.SwarmPort),
-			MaxMessageBuffer: o.SwarmMaxMessageBuffer,
-			LeaveTimeout:     o.SwarmLeaveTimeout,
-			Debug:            log.GetLevel() == log.DebugLevel,
-		}
-
-		if o.Kubernetes {
-			swops.KubernetesOptions = &swarm.KubernetesOptions{
-				KubernetesInCluster:  o.KubernetesInCluster,
-				KubernetesAPIBaseURL: o.KubernetesURL,
-				Namespace:            o.SwarmKubernetesNamespace,
-				LabelSelectorKey:     o.SwarmKubernetesLabelSelectorKey,
-				LabelSelectorValue:   o.SwarmKubernetesLabelSelectorValue,
+		if len(o.SwarmRedisURLs) > 0 {
+			log.Infof("Redis based swarm with %d shards", len(o.SwarmRedisURLs))
+			redisOptions = &ratelimit.RedisOptions{
+				Addrs:        o.SwarmRedisURLs,
+				ReadTimeout:  o.SwarmRedisReadTimeout,
+				WriteTimeout: o.SwarmRedisWriteTimeout,
+				PoolTimeout:  o.SwarmRedisPoolTimeout,
+				MinIdleConns: o.SwarmRedisMinIdleConns,
+				MaxIdleConns: o.SwarmRedisMaxIdleConns,
 			}
-		}
-
-		if o.SwarmStaticSelf != "" {
-			self, err := swarm.NewStaticNodeInfo(o.SwarmStaticSelf, o.SwarmStaticSelf)
-			if err != nil {
-				log.Fatalf("Failed to get static NodeInfo: %v", err)
+		} else {
+			log.Infof("Start swim based swarm")
+			swops = &swarm.Options{
+				SwarmPort:        uint16(o.SwarmPort),
+				MaxMessageBuffer: o.SwarmMaxMessageBuffer,
+				LeaveTimeout:     o.SwarmLeaveTimeout,
+				Debug:            log.GetLevel() == log.DebugLevel,
 			}
-			other := []*swarm.NodeInfo{self}
 
-			for _, addr := range strings.Split(o.SwarmStaticOther, ",") {
-				ni, err := swarm.NewStaticNodeInfo(addr, addr)
+			if o.Kubernetes {
+				swops.KubernetesOptions = &swarm.KubernetesOptions{
+					KubernetesInCluster:  o.KubernetesInCluster,
+					KubernetesAPIBaseURL: o.KubernetesURL,
+					Namespace:            o.SwarmKubernetesNamespace,
+					LabelSelectorKey:     o.SwarmKubernetesLabelSelectorKey,
+					LabelSelectorValue:   o.SwarmKubernetesLabelSelectorValue,
+				}
+			}
+
+			if o.SwarmStaticSelf != "" {
+				self, err := swarm.NewStaticNodeInfo(o.SwarmStaticSelf, o.SwarmStaticSelf)
 				if err != nil {
 					log.Fatalf("Failed to get static NodeInfo: %v", err)
 				}
-				other = append(other, ni)
+				other := []*swarm.NodeInfo{self}
+
+				for _, addr := range strings.Split(o.SwarmStaticOther, ",") {
+					ni, err := swarm.NewStaticNodeInfo(addr, addr)
+					if err != nil {
+						log.Fatalf("Failed to get static NodeInfo: %v", err)
+					}
+					other = append(other, ni)
+				}
+
+				swops.StaticSwarm = swarm.NewStaticSwarm(self, other)
 			}
 
-			swops.StaticSwarm = swarm.NewStaticSwarm(self, other)
+			theSwarm, err := swarm.NewSwarm(swops)
+			if err != nil {
+				log.Errorf("failed to init swarm with options %+v: %v", swops, err)
+			}
+			defer theSwarm.Leave()
+			swarmer = theSwarm
 		}
-
-		theSwarm, err = swarm.NewSwarm(swops)
-		if err != nil {
-			log.Errorf("failed to init swarm with options %+v: %v", swops, err)
-		}
-		defer theSwarm.Leave()
 	}
 
 	if o.EnableRatelimiters || len(o.RatelimitSettings) > 0 {
 		log.Infof("enabled ratelimiters %v: %v", o.EnableRatelimiters, o.RatelimitSettings)
-		proxyParams.RateLimiters = ratelimit.NewSwarmRegistry(theSwarm, o.RatelimitSettings...)
+		reg := ratelimit.NewSwarmRegistry(swarmer, redisOptions, o.RatelimitSettings...)
+		defer reg.Close()
+		proxyParams.RateLimiters = reg
 	}
 
 	if o.EnableBreakers || len(o.BreakerSettings) > 0 {

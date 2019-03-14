@@ -29,6 +29,7 @@ import (
 	"github.com/zalando/skipper"
 	"github.com/zalando/skipper/dataclients/kubernetes"
 	"github.com/zalando/skipper/proxy"
+	"github.com/zalando/skipper/ratelimit"
 	"github.com/zalando/skipper/swarm"
 )
 
@@ -52,6 +53,7 @@ const (
 	defaultApplicationLogLevel  = "INFO"
 
 	// connections, timeouts:
+	defaultWaitForHealthcheckInterval   = (10 + 5) * 3 * time.Second // kube-ingress-aws-controller default
 	defaultReadTimeoutServer            = 5 * time.Minute
 	defaultReadHeaderTimeoutServer      = 60 * time.Second
 	defaultWriteTimeoutServer           = 60 * time.Second
@@ -175,6 +177,7 @@ const (
 	apiUsageMonitoringRealmsTrackingPatternUsage        = "regular expression used for matching monitored realms (defaults is 'services')"
 
 	// connections, timeouts:
+	waitForHealthcheckIntervalUsage   = "period waiting to become unhealthy in the loadbalancer pool in front of this instance, before shutdown triggered by SIGINT or SIGTERM"
 	idleConnsPerHostUsage             = "maximum idle connections per backend host"
 	closeIdleConnsPeriodUsage         = "period of closing all idle connections in seconds or as a duration string. Not closing when less than 0"
 	backendFlushIntervalUsage         = "flush interval for upgraded proxy connections"
@@ -204,6 +207,11 @@ const (
 	swarmLeaveTimeoutUsage                 = "swarm leave timeout to use for leaving the memberlist on timeout"
 	swarmStaticSelfUsage                   = "set static swarm self node, for example 127.0.0.1:9001"
 	swarmStaticOtherUsage                  = "set static swarm all nodes, for example 127.0.0.1:9002,127.0.0.1:9003"
+	swarmRedisReadTimeoutUsage             = "set redis socket read timeout"
+	swarmRedisWriteTimeoutUsage            = "set redis socket write timeout"
+	swarmRedisPoolTimeoutUsage             = "set redis get connection from pool timeout"
+	swarmRedisMaxConnsUsage                = "set max number of connections to redis"
+	swarmRedisMinConnsUsage                = "set min number of connections to redis"
 )
 
 var (
@@ -319,6 +327,7 @@ var (
 	apiUsageMonitoringRealmsTrackingPattern        string
 
 	// connections, timeouts:
+	waitForHealthcheckInterval   time.Duration
 	idleConnsPerHost             int
 	closeIdleConnsPeriod         string
 	backendFlushInterval         time.Duration
@@ -339,7 +348,15 @@ var (
 	maxIdleConnsBackend          int
 
 	// swarm:
-	enableSwarm                       bool
+	enableSwarm bool
+	// redis based
+	swarmRedisURLs         swarmRedisFlags
+	swarmRedisReadTimeout  time.Duration
+	swarmRedisWriteTimeout time.Duration
+	swarmRedisPoolTimeout  time.Duration
+	swarmRedisMinConns     int
+	swarmRedisMaxConns     int
+	// swim based
 	swarmKubernetesNamespace          string
 	swarmKubernetesLabelSelectorKey   string
 	swarmKubernetesLabelSelectorValue string
@@ -461,6 +478,8 @@ func init() {
 	flag.StringVar(&apiUsageMonitoringRealmsTrackingPattern, "api-usage-monitoring-realms-tracking-pattern", defaultApiUsageMonitoringRealmsTrackingPattern, apiUsageMonitoringRealmsTrackingPatternUsage)
 
 	// connections, timeouts:
+	flag.DurationVar(&waitForHealthcheckInterval, "wait-for-healthcheck-interval", defaultWaitForHealthcheckInterval, waitForHealthcheckIntervalUsage)
+
 	flag.IntVar(&idleConnsPerHost, "idle-conns-num", proxy.DefaultIdleConnsPerHost, idleConnsPerHostUsage)
 	flag.StringVar(&closeIdleConnsPeriod, "close-idle-conns-period", strconv.Itoa(int(proxy.DefaultCloseIdleConnsPeriod/time.Second)), closeIdleConnsPeriodUsage)
 	flag.DurationVar(&backendFlushInterval, "backend-flush-interval", defaultBackendFlushInterval, backendFlushIntervalUsage)
@@ -480,6 +499,12 @@ func init() {
 	flag.DurationVar(&expectContinueTimeoutBackend, "expect-continue-timeout-backend", defaultExpectContinueTimeoutBackend, expectContinueTimeoutBackendUsage)
 	flag.IntVar(&maxIdleConnsBackend, "max-idle-connection-backend", defaultMaxIdleConnsBackend, maxIdleConnsBackendUsage)
 	flag.BoolVar(&enableSwarm, "enable-swarm", false, enableSwarmUsage)
+	flag.Var(&swarmRedisURLs, "swarm-redis-urls", swarmRedisURLsUsage)
+	flag.DurationVar(&swarmRedisReadTimeout, "swarm-redis-read-timeout", ratelimit.DefaultReadTimeout, swarmRedisReadTimeoutUsage)
+	flag.DurationVar(&swarmRedisWriteTimeout, "swarm-redis-write-timeout", ratelimit.DefaultWriteTimeout, swarmRedisWriteTimeoutUsage)
+	flag.DurationVar(&swarmRedisPoolTimeout, "swarm-redis-pool-timeout", ratelimit.DefaultPoolTimeout, swarmRedisPoolTimeoutUsage)
+	flag.IntVar(&swarmRedisMinConns, "swarm-redis-min-conns", ratelimit.DefaultMinConns, swarmRedisMinConnsUsage)
+	flag.IntVar(&swarmRedisMaxConns, "swarm-redis-max-conns", ratelimit.DefaultMaxConns, swarmRedisMaxConnsUsage)
 	flag.StringVar(&swarmKubernetesNamespace, "swarm-namespace", swarm.DefaultNamespace, swarmKubernetesNamespaceUsage)
 	flag.StringVar(&swarmKubernetesLabelSelectorKey, "swarm-label-selector-key", swarm.DefaultLabelSelectorKey, swarmKubernetesLabelSelectorKeyUsage)
 	flag.StringVar(&swarmKubernetesLabelSelectorValue, "swarm-label-selector-value", swarm.DefaultLabelSelectorValue, swarmKubernetesLabelSelectorValueUsage)
@@ -676,6 +701,7 @@ func main() {
 		OIDCSecretsFile:                oidcSecretsFile,
 
 		// connections, timeouts:
+		WaitForHealthcheckInterval:   waitForHealthcheckInterval,
 		IdleConnectionsPerHost:       idleConnsPerHost,
 		CloseIdleConnsPeriod:         time.Duration(clsic) * time.Second,
 		BackendFlushInterval:         backendFlushInterval,
@@ -696,14 +722,22 @@ func main() {
 		MaxIdleConnsBackend:          maxIdleConnsBackend,
 
 		// swarm:
-		EnableSwarm:                       enableSwarm,
+		EnableSwarm: enableSwarm,
+		// redis based
+		SwarmRedisURLs:         swarmRedisURLs.Get(),
+		SwarmRedisReadTimeout:  swarmRedisReadTimeout,
+		SwarmRedisWriteTimeout: swarmRedisWriteTimeout,
+		SwarmRedisPoolTimeout:  swarmRedisPoolTimeout,
+		SwarmRedisMinIdleConns: swarmRedisMinConns,
+		SwarmRedisMaxIdleConns: swarmRedisMaxConns,
+		// swim based
 		SwarmKubernetesNamespace:          swarmKubernetesNamespace,
 		SwarmKubernetesLabelSelectorKey:   swarmKubernetesLabelSelectorKey,
 		SwarmKubernetesLabelSelectorValue: swarmKubernetesLabelSelectorValue,
 		SwarmPort:                         swarmPort,
 		SwarmMaxMessageBuffer:             swarmMaxMessageBuffer,
 		SwarmLeaveTimeout:                 swarmLeaveTimeout,
-
+		// swim on localhost for testing
 		SwarmStaticSelf:  swarmStaticSelf,
 		SwarmStaticOther: swarmStaticOther,
 	}

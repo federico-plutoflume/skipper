@@ -174,11 +174,8 @@ type Options struct {
 	// KubernetesEastWestDomain sets the DNS domain to be used for east west traffic, defaults to "skipper.cluster.local"
 	KubernetesEastWestDomain string
 
-	// KubernetesConfigMapName sets K8S config map to use as a source of default filter configurations
-	KubernetesConfigMapName string
-
-	// KubernetesConfigMapNamespace sets K8S config map's namespace to use as a source of default filter configurations
-	KubernetesConfigMapNamespace string
+	// KubernetesConfigMapFileName sets K8S config map file name to use as a source of default filter configurations
+	KubernetesConfigMapFileName string
 }
 
 // Client is a Skipper DataClient implementation used to create routes based on Kubernetes Ingress settings.
@@ -202,8 +199,7 @@ type Client struct {
 	ingressesURI                string
 	servicesURI                 string
 	endpointsURI                string
-	configMapName               string
-	configMapNamespace          string
+	configMapFileName           string
 }
 
 var nonWord = regexp.MustCompile(`\W`)
@@ -298,8 +294,7 @@ func New(o Options) (*Client, error) {
 		ingressesURI:                ingressesClusterURI,
 		servicesURI:                 servicesClusterURI,
 		endpointsURI:                endpointsClusterURI,
-		configMapName:               o.KubernetesConfigMapName,
-		configMapNamespace:          o.KubernetesConfigMapNamespace,
+		configMapFileName:           o.KubernetesConfigMapFileName,
 	}
 	if o.KubernetesNamespace != "" {
 		result.setNamespace(o.KubernetesNamespace)
@@ -1387,19 +1382,19 @@ func (c *Client) Close() {
 }
 
 func (c *Client) fetchDefaultFilterConfigs() map[resourceId]string {
-	if c.configMapNamespace == "" || c.configMapName == "" {
-		log.Debug("default filters via ConfigMap are disabled")
+	if c.configMapFileName == "" {
+		log.Debug("default config map filters are disabled")
 		return make(map[resourceId]string)
 	}
 
 	filters, err := c.getDefaultFilterConfigurations()
 
 	if err != nil {
-		log.WithError(err).Error("could not fetch default filter configurations (config map)")
+		log.WithError(err).Error("could not fetch default config map filters")
 		return make(map[resourceId]string)
 	}
 
-	log.WithField("#configs", len(filters)).Debug("default filter configurations loaded")
+	log.Debugf("%d filter configurations loaded", len(filters))
 
 	return filters
 }
@@ -1415,7 +1410,7 @@ func (c *Client) getDefaultFilterConfigurations() (map[resourceId]string, error)
 	for resource, config := range cm.Data {
 		r := strings.Split(resource, ".") // format: {service}.{namespace}
 		if len(r) != 2 {
-			log.WithField("key", r).Warn("could not parse config map entry")
+			log.Debugf("could not parse config map entry [%s]", r)
 			continue
 		} else {
 			filters[resourceId{name: r[0], namespace: r[1]}] = config
@@ -1427,15 +1422,13 @@ func (c *Client) getDefaultFilterConfigurations() (map[resourceId]string, error)
 
 func (c *Client) loadConfigMap() (*configMap, error) {
 	cm := &configMap{}
-	path := fmt.Sprintf(configMapFmt, c.configMapNamespace, c.configMapName)
-	if err := c.getJSON(path, cm); err != nil {
-		log.Debugf("requesting config map failed: %v", err)
+	content, err := ioutil.ReadFile(c.configMapFileName)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(content, cm); err != nil {
 		return nil, err
 	}
 
-	log.WithFields(log.Fields{
-		"configmap name":      c.configMapName,
-		"configmap namespace": c.configMapNamespace,
-	}).Debug("config map received")
 	return cm, nil
 }

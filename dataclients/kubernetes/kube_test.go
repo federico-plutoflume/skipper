@@ -41,7 +41,6 @@ type testAPI struct {
 	services  *serviceList
 	endpoints *endpointList
 	ingresses *ingressList
-	configmap *configMap
 	server    *httptest.Server
 	failNext  bool
 }
@@ -408,7 +407,6 @@ func newTestAPIWithEndpoints(t *testing.T, s *serviceList, i *ingressList, e *en
 		services:  s,
 		ingresses: i,
 		endpoints: e,
-		configmap: nil,
 	}
 
 	api.server = httptest.NewServer(api)
@@ -432,8 +430,6 @@ func (api *testAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configMapURI := fmt.Sprintf(configMapFmt, "api-infrastructure", "skipperdefaultconfiguration")
-
 	switch r.URL.Path {
 	case ingressesClusterURI:
 		if err := respondJSON(w, api.ingresses); err != nil {
@@ -447,11 +443,6 @@ func (api *testAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case endpointsClusterURI:
 		if err := respondJSON(w, api.endpoints); err != nil {
-			api.test.Error(err)
-		}
-		return
-	case configMapURI:
-		if err := respondJSON(w, api.configmap); err != nil {
 			api.test.Error(err)
 		}
 		return
@@ -3635,7 +3626,7 @@ func TestSkipperDefaultFilters(t *testing.T) {
 		api.services = testServices()
 		api.ingresses.Items = testIngresses()
 
-		dc, err := New(Options{ // ConfigMap settings are not set
+		dc, err := New(Options{
 			KubernetesURL: api.server.URL,
 		})
 		if err != nil {
@@ -3655,12 +3646,10 @@ func TestSkipperDefaultFilters(t *testing.T) {
 		api.ingresses = &ingressList{Items: []*ingressItem{testIngress("namespace1", "default-only",
 			"service1", "", "", "", "", "", backendPort{8080}, 1.0,
 			testRule("www.example.org", testPathRule("/", "service1", backendPort{"port1"})))}}
-		api.configmap = &configMap{Data: map[string]string{"service1.namespace1": "consecutiveBreaker(15)"}}
 
 		dc, err := New(Options{
 			KubernetesURL:                api.server.URL,
-			KubernetesConfigMapNamespace: "api-infrastructure",
-			KubernetesConfigMapName:      "skipperdefaultconfiguration",
+			KubernetesConfigMapFileName: "fixtures/default-config-map.json",
 		})
 		if err != nil {
 			t.Error(err)
@@ -3682,12 +3671,10 @@ func TestSkipperDefaultFilters(t *testing.T) {
 		api.ingresses = &ingressList{Items: []*ingressItem{testIngress("namespace1", "default-only",
 			"service1", "", "localRatelimit(20,\"1m\")", "", "", "", backendPort{8080}, 1.0,
 			testRule("www.example.org", testPathRule("/", "service1", backendPort{"port1"})))}}
-		api.configmap = &configMap{Data: map[string]string{"service1.namespace1": "consecutiveBreaker(15)"}}
 
 		dc, err := New(Options{
 			KubernetesURL:                api.server.URL,
-			KubernetesConfigMapNamespace: "api-infrastructure",
-			KubernetesConfigMapName:      "skipperdefaultconfiguration",
+			KubernetesConfigMapFileName: "fixtures/default-config-map.json",
 		})
 		if err != nil {
 			t.Error(err)
@@ -3707,8 +3694,7 @@ func TestSkipperDefaultFilters(t *testing.T) {
 
 	t.Run("check fetchDefaultFilterConfigs returns empty map if fails to get the config map", func(t *testing.T) {
 		dc, err := New(Options{
-			KubernetesConfigMapNamespace: "api-infrastructure",
-			KubernetesConfigMapName:      "skipperdefaultconfiguration",
+			KubernetesConfigMapFileName: "fixtures/default-config-map.yaml",
 		})
 		if err != nil {
 			t.Error(err)
